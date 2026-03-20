@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "deepcelltypes-nimbus"
+version = "0.1.0"
+description = "Nimbus UNet marker positivity prediction baseline"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "deepcelltypes @ git+https://github.com/xuefei-wang/deepcelltypes-cell-type-assignment-pytorch.git",
+    "Nimbus-Inference",
+    "torch",
+    "click",
+    "numpy",
+    "pandas",
+    "tqdm",
+    "scipy",
+    "zarr>=3.0",
+    "scikit-image",
+]
