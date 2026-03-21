@@ -279,7 +279,7 @@ def main(
         return
 
     from nimbus_inference.nimbus import Nimbus
-    from nimbus_inference.utils import prepare_input_data, prepare_binary_mask
+    from nimbus_inference.utils import prepare_binary_mask
     import torch
 
     # Set device
