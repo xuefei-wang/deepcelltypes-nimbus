@@ -373,10 +373,54 @@ def main(
     from scipy.ndimage import mean as ndimage_mean
     import cv2
 
-    # Magnification rescale factor (canonical Nimbus predict_fovs uses
-    # scale = model_magnification / dataset_magnification; default 10/20 = 0.5).
-    rescale_factor = nimbus.model_magnification / 20.0 if hasattr(nimbus, "model_magnification") else 0.5
-    print(f"Inference rescale factor: {rescale_factor} (paper-faithful canonical Nimbus pipeline)")
+    # Nimbus model expected mpp (model_magnification=10 → 1.0 µm/px;
+    # canonical Nimbus encodes this as 10.0 / model_magnification).
+    model_magnification = float(getattr(nimbus, "model_magnification", 10))
+    target_mpp = 10.0 / model_magnification
+    print(f"Nimbus model_magnification={model_magnification} → target mpp={target_mpp}")
+
+    # Build canonical Nimbus normalization dict from raw image/ intensities
+    # (paper-faithful: prepare_normalization_dict, n_subset=10, q=0.999).
+    # Replaces the previous double-normalization on already-clipped preprocessed/raw.
+    NORM_QUANTILE = 0.999
+    NORM_N_SUBSET = 10
+    NORM_SEED = 42
+
+    def _build_normalization_dict(zf, fov_keys, n_subset, seed, quantile):
+        """Compute per-channel mean q-quantile across n_subset randomly-sampled FOVs.
+
+        Mirrors Nimbus-Inference's prepare_normalization_dict but works directly
+        on archive zarr without the MultiplexDataset adapter. Falls back to None
+        for any dataset_key that lacks the un-normalized image/ array.
+        """
+        rng = np.random.default_rng(seed)
+        candidates = [k for k in fov_keys if "image" in zf[k]]
+        if not candidates:
+            return None
+        sample_n = min(n_subset, len(candidates))
+        chosen = rng.choice(candidates, size=sample_n, replace=False).tolist()
+        per_channel = {}
+        print(f"Building normalization dict from {sample_n} FOVs (canonical n_subset={n_subset})...")
+        for k in tqdm(chosen, desc="Norm sampling"):
+            img = zf[k]["image"]
+            ch_names = list(
+                img.attrs.get("standardized_channels")
+                or img.attrs.get("channels", [])
+            )
+            for ch_idx, ch_name in enumerate(ch_names):
+                ch_img = img[ch_idx][:].astype(np.float32)
+                fg = ch_img[ch_img > 0]
+                if len(fg) > 0:
+                    q = float(np.quantile(fg, quantile))
+                    if q > 0:
+                        per_channel.setdefault(ch_name, []).append(q)
+        norm_dict = {ch: float(np.mean(qs)) for ch, qs in per_channel.items()}
+        print(f"Normalization dict covers {len(norm_dict)} channels")
+        return norm_dict
+
+    norm_dict = _build_normalization_dict(zf, dataset_keys, NORM_N_SUBSET, NORM_SEED, NORM_QUANTILE)
+    if norm_dict is None:
+        print("Warning: no FOVs with raw image/ array — falling back to per-FOV q999 on preprocessed/raw")
 
     def _predict_with_tta(input_data: np.ndarray) -> np.ndarray:
         """Run Nimbus prediction with paper-mandated TTA (4 rotations × 2 flips averaged)."""
@@ -431,29 +475,58 @@ def main(
             "dataset_name": [dataset_key] * len(cell_indices),
         }
 
-        raw_zarr = ds["preprocessed"]["raw"]
-        h_native, w_native = mask.shape
-        h_scaled = max(1, int(round(h_native * rescale_factor)))
-        w_scaled = max(1, int(round(w_native * rescale_factor)))
-        # Pre-rescale binary mask once per FOV
+        # Read raw image/ array (un-normalized uint16); fall back to preprocessed/raw
+        # if image/ is unavailable for this FOV (then the legacy double-norm path runs).
+        if "image" in ds and norm_dict is not None:
+            img_zarr = ds["image"]
+            img_channel_names = list(
+                img_zarr.attrs.get("standardized_channels")
+                or img_zarr.attrs.get("channels", [])
+            )
+            img_mpp = float(img_zarr.attrs.get("mpp", 0.5))
+            use_raw_image = True
+        else:
+            img_zarr = ds["preprocessed"]["raw"]
+            img_channel_names = channel_names
+            img_mpp = 0.5  # preprocessed is at standard 0.5 µm/px
+            use_raw_image = False
+
+        h_mask, w_mask = mask.shape
+        # Per-FOV target shape based on actual image mpp (canonical Nimbus rescales
+        # by scope ratio, e.g. 20× → 10× = 0.5×).
+        scale = img_mpp / target_mpp
+        h_native, w_native = img_zarr.shape[1], img_zarr.shape[2]
+        h_scaled = max(1, int(round(h_native * scale)))
+        w_scaled = max(1, int(round(w_native * scale)))
+
+        # Resize binary mask from preprocessed (mask) resolution to model-target resolution.
         binary_mask_scaled = cv2.resize(
             binary_mask.astype(np.float32), (w_scaled, h_scaled),
             interpolation=cv2.INTER_NEAREST,
         )
 
         # Process each channel (load lazily from zarr to avoid O(C*H*W) memory)
-        for ch_idx, ch_name in enumerate(channel_names):
-            # Load single channel from zarr (avoids loading entire C×H×W array)
-            channel_img = raw_zarr[ch_idx].astype(np.float32)  # (H, W)
+        for ch_idx, ch_name in enumerate(img_channel_names):
+            channel_img = img_zarr[ch_idx][:].astype(np.float32)  # (H_native, W_native)
 
-            # Per-channel quantile normalization (canonical Nimbus-Inference 0.0.5 default)
-            foreground = channel_img[channel_img > 0]
-            if len(foreground) > 0:
-                q999 = np.quantile(foreground, 0.999)
-                if q999 > 0:
-                    channel_img = np.clip(channel_img / q999, 0, 1)
+            # Single-pass paper-faithful normalization:
+            # - When reading raw image/: divide by canonical n=10 cross-FOV q999 dict
+            # - When falling back to preprocessed/raw: archive data is already [0,1],
+            #   so we skip the second normalization
+            if use_raw_image:
+                norm_factor = norm_dict.get(ch_name, 0.0)
+                if norm_factor > 0:
+                    channel_img = np.clip(channel_img / norm_factor, 0, 1)
+                else:
+                    # No norm factor available for this channel — fall back to per-FOV q999.
+                    fg = channel_img[channel_img > 0]
+                    if len(fg) > 0:
+                        q = float(np.quantile(fg, NORM_QUANTILE))
+                        if q > 0:
+                            channel_img = np.clip(channel_img / q, 0, 1)
+            # else: preprocessed/raw is already in [0, 1] — feed directly, no second q999.
 
-            # Rescale to model magnification (paper-faithful — matches canonical predict_fovs)
+            # Rescale to model magnification (matches canonical predict_fovs)
             channel_img_scaled = cv2.resize(
                 channel_img, (w_scaled, h_scaled), interpolation=cv2.INTER_LINEAR,
             )
@@ -466,13 +539,13 @@ def main(
             pred_np = _predict_with_tta(input_data)
             pred_np = pred_np[0, 0]  # (H_scaled, W_scaled)
 
-            # Resize prediction back to native resolution for per-cell aggregation
-            pred_native = cv2.resize(
-                pred_np, (w_native, h_native), interpolation=cv2.INTER_LINEAR,
+            # Resize prediction to mask resolution for per-cell aggregation
+            pred_at_mask = cv2.resize(
+                pred_np, (w_mask, h_mask), interpolation=cv2.INTER_LINEAR,
             )
 
             # Vectorized mean prediction per cell (single pass over mask)
-            channel_preds = ndimage_mean(pred_native, labels=mask, index=cell_indices_arr)
+            channel_preds = ndimage_mean(pred_at_mask, labels=mask, index=cell_indices_arr)
             channel_preds = np.nan_to_num(channel_preds, nan=0.0)
 
             fov_results[ch_name] = channel_preds.tolist()
