@@ -96,8 +96,12 @@ def load_fov_data(zf, dataset_key: str, load_raw: bool = True) -> Tuple[Optional
                         cell_indices.append(int(val))
                         cell_types.append(str(std_name))
                     elif isinstance(val, (list, tuple)) and len(val) == 2:
-                        # Centroid coordinate — reverse-lookup cell index
-                        target = (float(val[0]), float(val[1]))
+                        # Centroid coordinate — reverse-lookup cell index.
+                        # Annotation centroids are in original-image coordinates;
+                        # preprocessed centroids are in scaled coordinates. Apply
+                        # scale_factor before matching (matches deepcelltypes/annotations.py).
+                        scale = float(preproc.attrs.get("scale_factor", 1.0))
+                        target = (float(val[0]) * scale, float(val[1]) * scale)
                         found_idx = None
                         for key, cent in centroids_raw.items():
                             if abs(cent[0] - target[0]) < 0.5 and abs(cent[1] - target[1]) < 0.5:
@@ -142,7 +146,8 @@ def compute_marker_positivity_metrics(
     marker_cols = [c for c in predictions.columns if c not in meta_cols]
 
     # Build a ground truth lookup: (dataset_name, cell_type, marker) -> gt_binary
-    # by melting each gt_df into long format
+    # by melting each gt_df into long format.
+    # Drop ambiguous-coded GT (val == 0.5 or val == 2) to match canonical Nimbus eval.
     gt_records = []
     for dataset_name, gt_df in ground_truth.items():
         for marker in gt_df.columns:
@@ -150,7 +155,15 @@ def compute_marker_positivity_metrics(
                 val = gt_df.loc[cell_type, marker]
                 if pd.isna(val) or val == "?":
                     continue
-                gt_records.append((dataset_name, cell_type, marker, float(val) >= 0.5))
+                # Skip ambiguous codes (canonical Nimbus uses 2 for "ambiguous"; some
+                # archives use 0.5). Strict 0/1 only.
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if fval not in (0.0, 1.0):
+                    continue
+                gt_records.append((dataset_name, cell_type, marker, fval >= 0.5))
 
     if not gt_records:
         return {"overall": {}, "per_marker": {}}
@@ -358,6 +371,35 @@ def main(
     fov_count = 0
 
     from scipy.ndimage import mean as ndimage_mean
+    import cv2
+
+    # Magnification rescale factor (canonical Nimbus predict_fovs uses
+    # scale = model_magnification / dataset_magnification; default 10/20 = 0.5).
+    rescale_factor = nimbus.model_magnification / 20.0 if hasattr(nimbus, "model_magnification") else 0.5
+    print(f"Inference rescale factor: {rescale_factor} (paper-faithful canonical Nimbus pipeline)")
+
+    def _predict_with_tta(input_data: np.ndarray) -> np.ndarray:
+        """Run Nimbus prediction with paper-mandated TTA (4 rotations × 2 flips averaged)."""
+        # input_data: (1, 2, H, W)
+        preds = []
+        # 4 rotations × {no flip, horizontal flip}
+        for k in range(4):
+            for flip in (False, True):
+                view = np.rot90(input_data, k=k, axes=(2, 3))
+                if flip:
+                    view = view[:, :, :, ::-1]
+                view = np.ascontiguousarray(view)
+                pred = nimbus.predict_segmentation(view)
+                if isinstance(pred, torch.Tensor):
+                    pred_np = pred.cpu().numpy()
+                else:
+                    pred_np = np.asarray(pred)
+                # Invert flip then rotation
+                if flip:
+                    pred_np = pred_np[:, :, :, ::-1]
+                pred_np = np.rot90(pred_np, k=-k, axes=(2, 3))
+                preds.append(pred_np)
+        return np.mean(preds, axis=0)
 
     for dataset_key in tqdm(dataset_keys, desc="Processing datasets"):
         ds = zf[dataset_key]
@@ -390,32 +432,47 @@ def main(
         }
 
         raw_zarr = ds["preprocessed"]["raw"]
+        h_native, w_native = mask.shape
+        h_scaled = max(1, int(round(h_native * rescale_factor)))
+        w_scaled = max(1, int(round(w_native * rescale_factor)))
+        # Pre-rescale binary mask once per FOV
+        binary_mask_scaled = cv2.resize(
+            binary_mask.astype(np.float32), (w_scaled, h_scaled),
+            interpolation=cv2.INTER_NEAREST,
+        )
 
         # Process each channel (load lazily from zarr to avoid O(C*H*W) memory)
         for ch_idx, ch_name in enumerate(channel_names):
             # Load single channel from zarr (avoids loading entire C×H×W array)
             channel_img = raw_zarr[ch_idx].astype(np.float32)  # (H, W)
 
-            # Per-channel quantile normalization (Nimbus default)
+            # Per-channel quantile normalization (canonical Nimbus-Inference 0.0.5 default)
             foreground = channel_img[channel_img > 0]
             if len(foreground) > 0:
                 q999 = np.quantile(foreground, 0.999)
                 if q999 > 0:
                     channel_img = np.clip(channel_img / q999, 0, 1)
 
-            # Prepare input: (1, 2, H, W) - [marker, binary_mask]
-            input_data = np.stack([channel_img, binary_mask], axis=0)[np.newaxis, ...]
+            # Rescale to model magnification (paper-faithful — matches canonical predict_fovs)
+            channel_img_scaled = cv2.resize(
+                channel_img, (w_scaled, h_scaled), interpolation=cv2.INTER_LINEAR,
+            )
 
-            # Run inference (predict_segmentation handles tiling for large images)
+            # Prepare input: (1, 2, H_scaled, W_scaled) - [marker, binary_mask]
+            input_data = np.stack([channel_img_scaled, binary_mask_scaled], axis=0)[np.newaxis, ...]
+
+            # Run inference with paper-mandated TTA (4 rotations × 2 flips averaged)
             # Note: UNet forward already applies sigmoid, output is in [0, 1]
-            pred = nimbus.predict_segmentation(input_data)
-            if isinstance(pred, torch.Tensor):
-                pred_np = pred.cpu().numpy()[0, 0]  # (H, W)
-            else:
-                pred_np = pred[0, 0]  # (H, W)
+            pred_np = _predict_with_tta(input_data)
+            pred_np = pred_np[0, 0]  # (H_scaled, W_scaled)
+
+            # Resize prediction back to native resolution for per-cell aggregation
+            pred_native = cv2.resize(
+                pred_np, (w_native, h_native), interpolation=cv2.INTER_LINEAR,
+            )
 
             # Vectorized mean prediction per cell (single pass over mask)
-            channel_preds = ndimage_mean(pred_np, labels=mask, index=cell_indices_arr)
+            channel_preds = ndimage_mean(pred_native, labels=mask, index=cell_indices_arr)
             channel_preds = np.nan_to_num(channel_preds, nan=0.0)
 
             fov_results[ch_name] = channel_preds.tolist()
