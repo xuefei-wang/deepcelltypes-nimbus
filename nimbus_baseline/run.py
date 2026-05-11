@@ -188,11 +188,22 @@ def compute_marker_positivity_metrics(
     y_true = merged["gt_binary"].astype(int).values
     y_pred = merged["pred_binary"].astype(int).values
 
-    # Per-marker metrics
+    # Per-marker tp/fp/fn/tn — the canonical intermediate representation that
+    # the shared deepcelltypes.utils.summarize_mp_per_marker helper expects.
+    # The main model's MPMetricsTracker also routes through this helper, so
+    # Nimbus and main numbers are bit-exact on the metric reduction.
+    from deepcelltypes.utils import summarize_mp_per_marker
+
+    per_marker_counts = {}
     per_marker_metrics = {}
     for marker, group in merged.groupby("marker"):
         yt = group["gt_binary"].astype(int).values
         yp = group["pred_binary"].astype(int).values
+        tp = int(((yp == 1) & (yt == 1)).sum())
+        fp = int(((yp == 1) & (yt == 0)).sum())
+        fn = int(((yp == 0) & (yt == 1)).sum())
+        tn = int(((yp == 0) & (yt == 0)).sum())
+        per_marker_counts[marker] = {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
         per_marker_metrics[marker] = {
             "accuracy": accuracy_score(yt, yp),
             "precision": precision_score(yt, yp, zero_division=0),
@@ -201,19 +212,25 @@ def compute_marker_positivity_metrics(
             "n_samples": len(yt),
         }
 
-    # Overall metrics. Report both micro (global pool) and macro (per-marker
-    # mean) F1 so the Nimbus number is directly comparable to the main model's
-    # MPMetricsTracker which reports per-marker macro F1.
-    per_marker_f1 = [m["f1"] for m in per_marker_metrics.values()]
-    macro_f1 = float(np.mean(per_marker_f1)) if per_marker_f1 else 0.0
+    summary = summarize_mp_per_marker(per_marker_counts)
+
     overall_metrics = {
+        # Legacy keys (kept for backwards compat with existing analysis scripts):
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),  # micro (global pool)
-        "macro_f1": macro_f1,                              # per-marker mean
         "n_samples": len(y_true),
-        "n_markers": len(per_marker_f1),
+        # Shared with main model's MPMetricsTracker (bit-exact reduction):
+        "mp_macro_f1": summary["mp_macro_f1"],
+        "mp_micro_f1": summary["mp_micro_f1"],
+        "mp_macro_precision": summary["mp_macro_precision"],
+        "mp_macro_recall": summary["mp_macro_recall"],
+        "mp_macro_accuracy": summary["mp_macro_accuracy"],
+        "mp_micro_precision": summary["mp_micro_precision"],
+        "mp_micro_recall": summary["mp_micro_recall"],
+        "mp_num_markers": summary["mp_num_markers"],
+        "mp_num_markers_excluded_from_macro_f1": summary["mp_num_markers_excluded_from_macro_f1"],
     }
 
     return {
@@ -579,14 +596,20 @@ def main(
         predictions_df, marker_positivity_gt, threshold=threshold
     )
 
-    print(f"\nOverall Marker Positivity Metrics:")
+    print(f"\nOverall Marker Positivity Metrics (shared reduction with main model):")
     overall = metrics['overall']
-    for metric_name in ("accuracy", "precision", "recall", "f1", "macro_f1"):
-        val = overall.get(metric_name, "N/A")
-        label = "Macro F1 (per-marker mean)" if metric_name == "macro_f1" else metric_name.capitalize()
+    for label, key in [
+        ("Macro F1 (per-marker, NaN-excluded)", "mp_macro_f1"),
+        ("Micro F1 (global pool)",              "mp_micro_f1"),
+        ("Macro Precision",                     "mp_macro_precision"),
+        ("Macro Recall",                        "mp_macro_recall"),
+        ("Macro Accuracy",                      "mp_macro_accuracy"),
+    ]:
+        val = overall.get(key, "N/A")
         print(f"  {label}: {val:.4f}" if isinstance(val, (int, float)) else f"  {label}: {val}")
     print(f"  N Samples: {overall.get('n_samples', 'N/A')}")
-    print(f"  N Markers: {overall.get('n_markers', 'N/A')}")
+    print(f"  N Markers: {overall.get('mp_num_markers', 'N/A')} "
+          f"(excluded from macro_f1: {overall.get('mp_num_markers_excluded_from_macro_f1', 0)})")
 
     # Print per-marker metrics (top 10 by sample count)
     if metrics["per_marker"]:
@@ -602,13 +625,18 @@ def main(
     # Log to wandb
     if enable_wandb:
         wandb.log({
+            # Shared-with-main-model keys (apples-to-apples comparison):
+            "marker_positivity/mp_macro_f1": metrics["overall"].get("mp_macro_f1", 0),
+            "marker_positivity/mp_micro_f1": metrics["overall"].get("mp_micro_f1", 0),
+            "marker_positivity/mp_macro_precision": metrics["overall"].get("mp_macro_precision", 0),
+            "marker_positivity/mp_macro_recall": metrics["overall"].get("mp_macro_recall", 0),
+            "marker_positivity/mp_macro_accuracy": metrics["overall"].get("mp_macro_accuracy", 0),
+            "marker_positivity/mp_num_markers": metrics["overall"].get("mp_num_markers", 0),
+            # Legacy keys retained for analysis-script compat:
             "marker_positivity/accuracy": metrics["overall"].get("accuracy", 0),
             "marker_positivity/precision": metrics["overall"].get("precision", 0),
             "marker_positivity/recall": metrics["overall"].get("recall", 0),
-            "marker_positivity/f1": metrics["overall"].get("f1", 0),        # micro
-            "marker_positivity/macro_f1": metrics["overall"].get("macro_f1", 0),
             "marker_positivity/n_samples": metrics["overall"].get("n_samples", 0),
-            "marker_positivity/n_markers": metrics["overall"].get("n_markers", 0),
         })
 
     # Save predictions
