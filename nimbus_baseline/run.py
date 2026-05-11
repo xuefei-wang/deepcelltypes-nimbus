@@ -201,13 +201,19 @@ def compute_marker_positivity_metrics(
             "n_samples": len(yt),
         }
 
-    # Overall metrics
+    # Overall metrics. Report both micro (global pool) and macro (per-marker
+    # mean) F1 so the Nimbus number is directly comparable to the main model's
+    # MPMetricsTracker which reports per-marker macro F1.
+    per_marker_f1 = [m["f1"] for m in per_marker_metrics.values()]
+    macro_f1 = float(np.mean(per_marker_f1)) if per_marker_f1 else 0.0
     overall_metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),  # micro (global pool)
+        "macro_f1": macro_f1,                              # per-marker mean
         "n_samples": len(y_true),
+        "n_markers": len(per_marker_f1),
     }
 
     return {
@@ -575,10 +581,12 @@ def main(
 
     print(f"\nOverall Marker Positivity Metrics:")
     overall = metrics['overall']
-    for metric_name in ("accuracy", "precision", "recall", "f1"):
+    for metric_name in ("accuracy", "precision", "recall", "f1", "macro_f1"):
         val = overall.get(metric_name, "N/A")
-        print(f"  {metric_name.capitalize()}: {val:.4f}" if isinstance(val, (int, float)) else f"  {metric_name.capitalize()}: {val}")
+        label = "Macro F1 (per-marker mean)" if metric_name == "macro_f1" else metric_name.capitalize()
+        print(f"  {label}: {val:.4f}" if isinstance(val, (int, float)) else f"  {label}: {val}")
     print(f"  N Samples: {overall.get('n_samples', 'N/A')}")
+    print(f"  N Markers: {overall.get('n_markers', 'N/A')}")
 
     # Print per-marker metrics (top 10 by sample count)
     if metrics["per_marker"]:
@@ -597,8 +605,10 @@ def main(
             "marker_positivity/accuracy": metrics["overall"].get("accuracy", 0),
             "marker_positivity/precision": metrics["overall"].get("precision", 0),
             "marker_positivity/recall": metrics["overall"].get("recall", 0),
-            "marker_positivity/f1": metrics["overall"].get("f1", 0),
+            "marker_positivity/f1": metrics["overall"].get("f1", 0),        # micro
+            "marker_positivity/macro_f1": metrics["overall"].get("macro_f1", 0),
             "marker_positivity/n_samples": metrics["overall"].get("n_samples", 0),
+            "marker_positivity/n_markers": metrics["overall"].get("n_markers", 0),
         })
 
     # Save predictions
