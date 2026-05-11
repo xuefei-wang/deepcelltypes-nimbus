@@ -24,7 +24,7 @@ from typing import Dict, List, Tuple, Optional, Any
 # Default data directory from environment
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data2"))
 
-from deepcelltypes.config import TissueNetConfig
+from deepcell_types.training.config import TissueNetConfig
 
 
 def check_nimbus_installed():
@@ -192,7 +192,7 @@ def compute_marker_positivity_metrics(
     # the shared deepcelltypes.utils.summarize_mp_per_marker helper expects.
     # The main model's MPMetricsTracker also routes through this helper, so
     # Nimbus and main numbers are bit-exact on the metric reduction.
-    from deepcelltypes.utils import summarize_mp_per_marker
+    from deepcell_types.training.metrics import summarize_mp_per_marker
 
     per_marker_counts = {}
     per_marker_metrics = {}
