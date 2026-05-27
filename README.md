@@ -29,7 +29,7 @@ python -m nimbus_baseline --model_name nimbus_0 --zarr_dir /path/to/zarr
 |------|---------|-------------|
 | `--model_name` | `nimbus_0` | Name for output files |
 | `--device_num` | `cuda:0` | Device for inference |
-| `--zarr_dir` | `$DATA_DIR/tissuenet-caitlin-labels.zarr` | Path to zarr archive |
+| `--zarr_dir` | `$DATA_DIR/expanded-tissuenet.zarr` | Path to zarr archive |
 | `--checkpoint` | `latest` | Nimbus checkpoint (`latest` or path) |
 | `--batch_size` | `4` | Batch size for inference |
 | `--threshold` | `0.5` | Marker positivity threshold |

@@ -246,7 +246,7 @@ def compute_marker_positivity_metrics(
 @click.option(
     "--zarr_dir",
     type=str,
-    default=str(DATA_DIR / "tissuenet-caitlin-labels.zarr"),
+    default=str(DATA_DIR / "expanded-tissuenet.zarr"),
 )
 @click.option(
     "--skip_datasets",
